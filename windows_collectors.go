@@ -349,7 +349,17 @@ func collectProcessModules(pid uint32) ([]ModuleInfo, error) {
 }
 
 func runCSVRowsNoHeader(ctx context.Context, command string, args ...string) ([][]string, error) {
-	cmd := exec.CommandContext(ctx, command, args...)
+	escapedArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		escapedArgs = append(escapedArgs, syscall.EscapeArg(arg))
+	}
+	commandLine := fmt.Sprintf(
+		"chcp 65001>nul & %s %s",
+		syscall.EscapeArg(command),
+		strings.Join(escapedArgs, " "),
+	)
+
+	cmd := exec.CommandContext(ctx, "cmd.exe", "/d", "/c", commandLine)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: windows.CREATE_NO_WINDOW,
@@ -465,6 +475,12 @@ func readStartupFolder(scope, location, path string) []AutorunEntry {
 	entries := make([]AutorunEntry, 0, len(items))
 	for _, item := range items {
 		name := item.Name()
+		if item.IsDir() && strings.EqualFold(name, "TaskEzDisabled") {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(name), ".disabled") {
+			continue
+		}
 		entries = append(entries, AutorunEntry{
 			Scope:    scope,
 			Location: location,

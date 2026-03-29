@@ -121,7 +121,11 @@ func disableStartupFolderAutorun(location, name string) error {
 		targetPath = location
 	}
 
-	disabledPath := targetPath + ".disabled"
+	disabledDir := filepath.Join(filepath.Dir(targetPath), "TaskEzDisabled")
+	if err := os.MkdirAll(disabledDir, 0o755); err != nil {
+		return err
+	}
+	disabledPath := filepath.Join(disabledDir, filepath.Base(targetPath)+".disabled")
 	return os.Rename(targetPath, disabledPath)
 }
 
