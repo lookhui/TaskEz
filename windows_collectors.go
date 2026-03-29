@@ -3,66 +3,60 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/csv"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
-	"unicode/utf8"
 	"unsafe"
 
 	"github.com/shirou/gopsutil/v4/process"
+	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
-	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/mgr"
-	"golang.org/x/text/encoding"
-	"golang.org/x/text/encoding/charmap"
-	"golang.org/x/text/encoding/japanese"
-	"golang.org/x/text/encoding/korean"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/encoding/traditionalchinese"
-	"golang.org/x/text/transform"
 )
 
+type win32ServiceRecord struct {
+	Name        string
+	DisplayName string
+	State       string
+	StartMode   string
+}
+
+type win32SystemDriverRecord struct {
+	Name        string
+	DisplayName string
+	State       string
+	StartMode   string
+	PathName    string
+	ServiceType string
+}
+
+type scheduledTaskRecord struct {
+	TaskName    string
+	TaskPath    string
+	State       uint32
+	Author      string
+	Description string
+	URI         string
+}
+
 func collectServices() ([]ServiceInfo, error) {
-	manager, err := mgr.Connect()
-	if err != nil {
-		return nil, err
-	}
-	defer manager.Disconnect()
-
-	serviceNames, err := manager.ListServices()
-	if err != nil {
+	var records []win32ServiceRecord
+	query := wmi.CreateQuery(&records, "", "Win32_Service")
+	if err := wmi.Query(query, &records); err != nil {
 		return nil, err
 	}
 
-	services := make([]ServiceInfo, 0, len(serviceNames))
-	for _, name := range serviceNames {
-		service, err := manager.OpenService(name)
-		if err != nil {
-			continue
-		}
-
-		config, configErr := service.Config()
-		status, statusErr := service.Query()
-		service.Close()
-
-		if configErr != nil || statusErr != nil {
-			continue
-		}
-
+	services := make([]ServiceInfo, 0, len(records))
+	for _, record := range records {
 		services = append(services, ServiceInfo{
-			Name:        name,
-			DisplayName: config.DisplayName,
-			State:       serviceState(status.State),
-			StartType:   serviceStartType(config.StartType),
+			Name:        strings.TrimSpace(record.Name),
+			DisplayName: strings.TrimSpace(record.DisplayName),
+			State:       strings.TrimSpace(record.State),
+			StartType:   translateServiceStartMode(record.StartMode),
 		})
 	}
 
@@ -129,24 +123,23 @@ func collectAutoruns() ([]AutorunEntry, error) {
 }
 
 func collectDrivers(ctx context.Context) ([]DriverInfo, error) {
-	rows, err := runCSVRowsNoHeader(ctx, "driverquery.exe", "/fo", "csv", "/v", "/nh")
-	if err != nil {
+	_ = ctx
+
+	var records []win32SystemDriverRecord
+	query := wmi.CreateQuery(&records, "", "Win32_SystemDriver")
+	if err := wmi.Query(query, &records); err != nil {
 		return nil, err
 	}
 
-	drivers := make([]DriverInfo, 0, len(rows))
-	for _, row := range rows {
-		if len(row) < 14 {
-			continue
-		}
-
+	drivers := make([]DriverInfo, 0, len(records))
+	for _, record := range records {
 		drivers = append(drivers, DriverInfo{
-			Name:        strings.TrimSpace(row[0]),
-			DisplayName: strings.TrimSpace(row[1]),
-			State:       strings.TrimSpace(row[5]),
-			StartMode:   translateDriverStartMode(strings.TrimSpace(row[4])),
-			Path:        strings.TrimSpace(row[13]),
-			ServiceType: strings.TrimSpace(row[3]),
+			Name:        strings.TrimSpace(record.Name),
+			DisplayName: strings.TrimSpace(record.DisplayName),
+			State:       strings.TrimSpace(record.State),
+			StartMode:   translateDriverStartMode(record.StartMode),
+			Path:        strings.TrimSpace(record.PathName),
+			ServiceType: strings.TrimSpace(record.ServiceType),
 		})
 	}
 
@@ -161,25 +154,28 @@ func collectDrivers(ctx context.Context) ([]DriverInfo, error) {
 }
 
 func collectScheduledTasks(ctx context.Context) ([]ScheduledTaskInfo, error) {
-	rows, err := runCSVRowsNoHeader(ctx, "schtasks.exe", "/query", "/fo", "csv", "/v", "/nh")
-	if err != nil {
+	_ = ctx
+
+	var records []scheduledTaskRecord
+	query := wmi.CreateQuery(&records, "", "MSFT_ScheduledTask")
+	if err := wmi.QueryNamespace(query, &records, `root\Microsoft\Windows\TaskScheduler`); err != nil {
 		return nil, err
 	}
 
-	tasks := make([]ScheduledTaskInfo, 0, len(rows))
-	for _, row := range rows {
-		if len(row) < 11 {
-			continue
+	tasks := make([]ScheduledTaskInfo, 0, len(records))
+	for _, record := range records {
+		command := strings.TrimSpace(record.URI)
+		if command == "" {
+			command = strings.TrimRight(record.TaskPath, `\`) + `\` + record.TaskName
 		}
 
-		path, name := splitTaskName(strings.TrimSpace(row[1]))
 		tasks = append(tasks, ScheduledTaskInfo{
-			Name:        name,
-			Path:        path,
-			State:       strings.TrimSpace(row[3]),
-			Author:      strings.TrimSpace(row[7]),
-			Description: strings.TrimSpace(row[10]),
-			Command:     strings.TrimSpace(row[8]),
+			Name:        strings.TrimSpace(record.TaskName),
+			Path:        strings.TrimSpace(record.TaskPath),
+			State:       scheduledTaskStateLabel(record.State),
+			Author:      strings.TrimSpace(record.Author),
+			Description: strings.TrimSpace(record.Description),
+			Command:     command,
 		})
 	}
 
@@ -356,99 +352,21 @@ func collectProcessModules(pid uint32) ([]ModuleInfo, error) {
 	return modules, nil
 }
 
-func runCSVRowsNoHeader(ctx context.Context, command string, args ...string) ([][]string, error) {
-	escapedArgs := make([]string, 0, len(args))
-	for _, arg := range args {
-		escapedArgs = append(escapedArgs, syscall.EscapeArg(arg))
-	}
-	commandLine := fmt.Sprintf(
-		"chcp 65001>nul & %s %s",
-		syscall.EscapeArg(command),
-		strings.Join(escapedArgs, " "),
-	)
-
-	cmd := exec.CommandContext(ctx, "cmd.exe", "/d", "/c", commandLine)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: windows.CREATE_NO_WINDOW,
-	}
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		return nil, fmt.Errorf("%s", message)
-	}
-
-	decoded, err := decodeCommandOutput(stdout.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	reader := csv.NewReader(strings.NewReader(decoded))
-	reader.LazyQuotes = true
-	reader.FieldsPerRecord = -1
-	records, err := reader.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-
-	return records, nil
-}
-
-func decodeCommandOutput(data []byte) (string, error) {
-	if len(data) == 0 {
-		return "", nil
-	}
-
-	if utf8.Valid(data) {
-		return string(data), nil
-	}
-
-	enc := windowsCodePageEncoding(windows.GetACP())
-	if enc == nil {
-		return string(data), nil
-	}
-
-	decoded, _, err := transform.String(enc.NewDecoder(), string(data))
-	if err != nil {
-		return "", err
-	}
-	return decoded, nil
-}
-
-func windowsCodePageEncoding(codePage uint32) encoding.Encoding {
-	switch codePage {
-	case 936:
-		return simplifiedchinese.GBK
-	case 950:
-		return traditionalchinese.Big5
-	case 932:
-		return japanese.ShiftJIS
-	case 949:
-		return korean.EUCKR
-	case 1252:
-		return charmap.Windows1252
+func scheduledTaskStateLabel(value uint32) string {
+	switch value {
+	case 0:
+		return "未知"
+	case 1:
+		return "禁用"
+	case 2:
+		return "排队"
+	case 3:
+		return "就绪"
+	case 4:
+		return "运行中"
 	default:
-		return nil
+		return fmt.Sprintf("状态 %d", value)
 	}
-}
-
-func splitTaskName(value string) (string, string) {
-	if value == "" {
-		return "\\", ""
-	}
-	lastIndex := strings.LastIndex(value, `\`)
-	if lastIndex <= 0 {
-		return "\\", strings.TrimPrefix(value, `\`)
-	}
-	return value[:lastIndex+1], value[lastIndex+1:]
 }
 
 func translateDriverStartMode(value string) string {
@@ -463,6 +381,25 @@ func translateDriverStartMode(value string) string {
 		return "启动"
 	case "system":
 		return "系统"
+	default:
+		return value
+	}
+}
+
+func translateServiceStartMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto", "automatic":
+		return "自动"
+	case "manual":
+		return "手动"
+	case "disabled":
+		return "禁用"
+	case "boot":
+		return "启动"
+	case "system":
+		return "系统"
+	case "delayed auto":
+		return "自动(延迟)"
 	default:
 		return value
 	}
@@ -542,42 +479,4 @@ func readStartupFolder(scope, location, path string) []AutorunEntry {
 	}
 
 	return entries
-}
-
-func serviceState(state svc.State) string {
-	switch state {
-	case svc.Stopped:
-		return "Stopped"
-	case svc.StartPending:
-		return "Start Pending"
-	case svc.StopPending:
-		return "Stop Pending"
-	case svc.Running:
-		return "Running"
-	case svc.ContinuePending:
-		return "Continue Pending"
-	case svc.PausePending:
-		return "Pause Pending"
-	case svc.Paused:
-		return "Paused"
-	default:
-		return fmt.Sprintf("State %d", state)
-	}
-}
-
-func serviceStartType(value uint32) string {
-	switch value {
-	case windows.SERVICE_BOOT_START:
-		return "启动"
-	case windows.SERVICE_SYSTEM_START:
-		return "系统"
-	case windows.SERVICE_AUTO_START:
-		return "自动"
-	case windows.SERVICE_DEMAND_START:
-		return "手动"
-	case windows.SERVICE_DISABLED:
-		return "禁用"
-	default:
-		return fmt.Sprintf("类型 %d", value)
-	}
 }
