@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/shirou/gopsutil/v4/process"
@@ -21,6 +22,13 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/transform"
 )
 
 func collectServices() ([]ServiceInfo, error) {
@@ -378,14 +386,58 @@ func runCSVRowsNoHeader(ctx context.Context, command string, args ...string) ([]
 		return nil, fmt.Errorf("%s", message)
 	}
 
-	reader := csv.NewReader(bytes.NewReader(stdout.Bytes()))
+	decoded, err := decodeCommandOutput(stdout.Bytes())
+	if err != nil {
+		return nil, err
+	}
+
+	reader := csv.NewReader(strings.NewReader(decoded))
 	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1
 	records, err := reader.ReadAll()
 	if err != nil {
 		return nil, err
 	}
 
 	return records, nil
+}
+
+func decodeCommandOutput(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", nil
+	}
+
+	if utf8.Valid(data) {
+		return string(data), nil
+	}
+
+	enc := windowsCodePageEncoding(windows.GetACP())
+	if enc == nil {
+		return string(data), nil
+	}
+
+	decoded, _, err := transform.String(enc.NewDecoder(), string(data))
+	if err != nil {
+		return "", err
+	}
+	return decoded, nil
+}
+
+func windowsCodePageEncoding(codePage uint32) encoding.Encoding {
+	switch codePage {
+	case 936:
+		return simplifiedchinese.GBK
+	case 950:
+		return traditionalchinese.Big5
+	case 932:
+		return japanese.ShiftJIS
+	case 949:
+		return korean.EUCKR
+	case 1252:
+		return charmap.Windows1252
+	default:
+		return nil
+	}
 }
 
 func splitTaskName(value string) (string, string) {
